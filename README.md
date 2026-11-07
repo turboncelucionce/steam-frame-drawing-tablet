@@ -1,6 +1,6 @@
 # Use your pen tablet in Steam Frame's native desktop
 
-Turns your pen tablet compatible with the Steam Frame, since it doesn't ship with the drivers by default
+Makes your pen tablet compatible with the Steam Frame, since it doesn't ship with the drivers by default
 
 Currently doesn't support tablet buttons and touch, but pens buttons and sensitivity work (Tested with Wacom CTH-670 in Krita)
 
