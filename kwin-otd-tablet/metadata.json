@@ -1,0 +1,8 @@
+{
+    "KPlugin": {
+        "Id": "otdtablet",
+        "Name": "OpenTabletDriver tablet",
+        "Description": "Feeds OpenTabletDriver's virtual pen into KWin as a real tablet (pressure, tilt)",
+        "EnabledByDefault": true
+    }
+}
