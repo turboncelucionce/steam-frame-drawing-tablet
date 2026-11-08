@@ -1,12 +1,13 @@
 /*
-    otdtablet: a KWin plugin that feeds OpenTabletDriver's virtual pen into KWin as a real
-    tablet, with pressure and tilt.
+    otdtablet: a KWin plugin that feeds OpenTabletDriver's virtual devices into KWin:
+    its pen as a real tablet (pressure, tilt), and its keyboard, which sends the shortcuts
+    bound to the tablet's express keys and pen buttons.
 
     Why: on the Steam Frame the desktop's KWin runs nested inside gamescope, so it never reads
     /dev/input itself, and gamescope doesn't pass tablet events on. This plugin opens
-    OpenTabletDriver's virtual tablet (a uinput device) from inside KWin and emits KWin's own
-    tablet tool events, exactly as KWin's libinput backend would. KWin then speaks the Wayland
-    tablet protocol to apps (and Xwayland turns it into X11 tablet devices for X11 apps).
+    OpenTabletDriver's uinput devices from inside KWin and emits KWin's own input events,
+    exactly as KWin's libinput backend would. KWin then speaks the Wayland tablet protocol to
+    apps (and Xwayland turns it into X11 tablet devices for X11 apps).
 
     SPDX-License-Identifier: GPL-2.0-or-later (it links against KWin)
 */
@@ -17,6 +18,7 @@
 #include "workspace.h"
 
 #include <QDir>
+#include <QSet>
 #include <QSocketNotifier>
 #include <QTimer>
 
@@ -34,6 +36,90 @@ static const QStringList s_tabletNames = {
     QStringLiteral("OpenTabletDriver Virtual Artist Tablet"),
     QStringLiteral("OpenTabletDriver Virtual Tablet"),
 };
+static const QString s_keyboardName = QStringLiteral("OpenTabletDriver Virtual Keyboard");
+
+static std::chrono::microseconds eventTime(const input_event &ev)
+{
+    return std::chrono::microseconds(qint64(ev.input_event_sec) * 1000000 + ev.input_event_usec);
+}
+
+static std::chrono::microseconds now()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
+}
+
+/**
+ * One of OpenTabletDriver's uinput devices, read from inside KWin.
+ * Subclasses say what kind of device it is and turn its events into KWin's.
+ */
+class OtdDevice : public InputDevice
+{
+    Q_OBJECT
+public:
+    OtdDevice(int fd, const QString &path, const QString &name)
+        : m_fd(fd)
+        , m_path(path)
+        , m_name(name)
+        , m_notifier(fd, QSocketNotifier::Read)
+    {
+        connect(&m_notifier, &QSocketNotifier::activated, this, &OtdDevice::readEvents);
+    }
+
+    ~OtdDevice() override { ::close(m_fd); }
+
+    QString sysPath() const override { return m_path; }
+    QString name() const override { return m_name; }
+    bool isEnabled() const override { return true; }
+    void setEnabled(bool) override { }
+    bool isKeyboard() const override { return false; }
+    bool isPointer() const override { return false; }
+    bool isTouchpad() const override { return false; }
+    bool isTouch() const override { return false; }
+    bool isTabletTool() const override { return false; }
+    bool isTabletPad() const override { return false; }
+    bool isTabletModeSwitch() const override { return false; }
+    bool isLidSwitch() const override { return false; }
+
+    // Release whatever is held, before the device goes away.
+    virtual void leave() { }
+
+Q_SIGNALS:
+    void gone();
+
+protected:
+    virtual void handle(const input_event &ev) = 0;
+
+    const int m_fd;
+
+private:
+    void readEvents()
+    {
+        input_event evs[64];
+        while (true) {
+            const ssize_t n = ::read(m_fd, evs, sizeof(evs));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EINTR) {
+                    return;
+                }
+                m_notifier.setEnabled(false);
+                Q_EMIT gone();
+                return;
+            }
+            if (n == 0) {
+                return;
+            }
+            for (ssize_t i = 0; i < n / ssize_t(sizeof(input_event)); ++i) {
+                handle(evs[i]);
+            }
+        }
+    }
+
+    const QString m_path;
+    const QString m_name;
+    QSocketNotifier m_notifier;
+};
+
+// ---------------------------------------------------------------- pen
 
 class OtdTool : public InputDeviceTabletTool
 {
@@ -63,17 +149,14 @@ struct AbsRange
     double normalized(int v) const { return max > min ? double(v - min) / double(max - min) : 0.0; }
 };
 
-class OtdTabletDevice : public InputDevice
+class OtdTabletDevice : public OtdDevice
 {
     Q_OBJECT
 public:
     OtdTabletDevice(int fd, const QString &path, const QString &name)
-        : m_fd(fd)
-        , m_path(path)
-        , m_name(name)
+        : OtdDevice(fd, path, name)
         , m_pen(new OtdTool(InputDeviceTabletTool::Pen, 0x07D0001, this))
         , m_eraser(new OtdTool(InputDeviceTabletTool::Eraser, 0x07D0002, this))
-        , m_notifier(fd, QSocketNotifier::Read)
     {
         for (int code : {ABS_X, ABS_Y, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y}) {
             input_absinfo info{};
@@ -82,39 +165,59 @@ public:
                 m_values[code] = info.value;
             }
         }
-        connect(&m_notifier, &QSocketNotifier::activated, this, &OtdTabletDevice::readEvents);
     }
 
-    ~OtdTabletDevice() override { ::close(m_fd); }
-
-    QString sysPath() const override { return m_path; }
-    QString name() const override { return m_name; }
-    bool isEnabled() const override { return true; }
-    void setEnabled(bool) override { }
-    bool isKeyboard() const override { return false; }
-    bool isPointer() const override { return false; }
-    bool isTouchpad() const override { return false; }
-    bool isTouch() const override { return false; }
     bool isTabletTool() const override { return true; }
-    bool isTabletPad() const override { return false; }
-    bool isTabletModeSwitch() const override { return false; }
-    bool isLidSwitch() const override { return false; }
 
     // Leave proximity cleanly before going away, so nothing stays pressed.
-    void leave()
+    void leave() override
     {
         if (m_near) {
-            const auto now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
             if (m_tipDown) {
-                emitTip(false, now);
+                emitTip(false, now());
             }
-            Q_EMIT tabletToolProximityEvent(position(), tiltX(), tiltY(), 0, 0, false, 0, m_activeTool, now, this);
+            Q_EMIT tabletToolProximityEvent(position(), tiltX(), tiltY(), 0, 0, false, 0, m_activeTool, now(), this);
             m_near = false;
         }
     }
 
-Q_SIGNALS:
-    void gone();
+protected:
+    void handle(const input_event &ev) override
+    {
+        switch (ev.type) {
+        case EV_ABS:
+            if (ev.code < ABS_CNT) {
+                m_values[ev.code] = ev.value;
+                m_axesChanged = true;
+            }
+            break;
+        case EV_KEY:
+            switch (ev.code) {
+            case BTN_TOOL_PEN:
+                m_sawToolKeys = true;
+                m_toolPen = ev.value;
+                break;
+            case BTN_TOOL_RUBBER:
+                m_sawToolKeys = true;
+                m_toolRubber = ev.value;
+                break;
+            case BTN_TOUCH:
+                m_touch = ev.value;
+                break;
+            case BTN_STYLUS:
+            case BTN_STYLUS2:
+            case BTN_STYLUS3:
+                m_buttons.append({ev.code, ev.value != 0});
+                break;
+            }
+            break;
+        case EV_SYN:
+            if (ev.code == SYN_REPORT) {
+                report(eventTime(ev));
+            }
+            break;
+        }
+    }
 
 private:
     QPointF position() const
@@ -150,65 +253,6 @@ private:
         Q_EMIT tabletToolTipEvent(position(), pressure(), tiltX(), tiltY(), 0, 0, down, 0, m_activeTool, time, this);
     }
 
-    void readEvents()
-    {
-        input_event evs[64];
-        while (true) {
-            const ssize_t n = ::read(m_fd, evs, sizeof(evs));
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EINTR) {
-                    return;
-                }
-                m_notifier.setEnabled(false);
-                Q_EMIT gone();
-                return;
-            }
-            if (n == 0) {
-                return;
-            }
-            for (ssize_t i = 0; i < n / ssize_t(sizeof(input_event)); ++i) {
-                handle(evs[i]);
-            }
-        }
-    }
-
-    void handle(const input_event &ev)
-    {
-        switch (ev.type) {
-        case EV_ABS:
-            if (ev.code < ABS_CNT) {
-                m_values[ev.code] = ev.value;
-                m_axesChanged = true;
-            }
-            break;
-        case EV_KEY:
-            switch (ev.code) {
-            case BTN_TOOL_PEN:
-                m_sawToolKeys = true;
-                m_toolPen = ev.value;
-                break;
-            case BTN_TOOL_RUBBER:
-                m_sawToolKeys = true;
-                m_toolRubber = ev.value;
-                break;
-            case BTN_TOUCH:
-                m_touch = ev.value;
-                break;
-            case BTN_STYLUS:
-            case BTN_STYLUS2:
-            case BTN_STYLUS3:
-                m_buttons.append({ev.code, ev.value != 0});
-                break;
-            }
-            break;
-        case EV_SYN:
-            if (ev.code == SYN_REPORT) {
-                report(std::chrono::microseconds(qint64(ev.input_event_sec) * 1000000 + ev.input_event_usec));
-            }
-            break;
-        }
-    }
-
     void report(std::chrono::microseconds time)
     {
         const bool near = m_sawToolKeys ? (m_toolPen || m_toolRubber) : true;
@@ -240,13 +284,9 @@ private:
         m_axesChanged = false;
     }
 
-    const int m_fd;
-    const QString m_path;
-    const QString m_name;
     OtdTool *const m_pen;
     OtdTool *const m_eraser;
     OtdTool *m_activeTool = nullptr;
-    QSocketNotifier m_notifier;
     AbsRange m_ranges[ABS_CNT];
     int m_values[ABS_CNT] = {};
     bool m_sawToolKeys = false;
@@ -258,6 +298,55 @@ private:
     bool m_axesChanged = false;
     QList<std::pair<uint, bool>> m_buttons;
 };
+
+// ---------------------------------------------------------------- keyboard
+
+/**
+ * OpenTabletDriver's virtual keyboard: it types the key bindings set on the tablet's express
+ * keys and pen buttons (Ctrl+Z and so on). Keys go to KWin like a real keyboard's, so they
+ * combine with other keyboards' modifiers and KWin does key repeat itself.
+ */
+class OtdKeyboardDevice : public OtdDevice
+{
+    Q_OBJECT
+public:
+    using OtdDevice::OtdDevice;
+
+    bool isKeyboard() const override { return true; }
+
+    void leave() override
+    {
+        const auto held = m_pressed;
+        for (quint32 key : held) {
+            Q_EMIT keyChanged(key, KeyboardKeyState::Released, now(), this);
+        }
+        m_pressed.clear();
+    }
+
+protected:
+    void handle(const input_event &ev) override
+    {
+        // value 2 is the kernel's autorepeat: skip it, KWin repeats held keys itself
+        if (ev.type != EV_KEY || ev.value > 1) {
+            return;
+        }
+        const bool pressed = ev.value == 1;
+        if (pressed == m_pressed.contains(ev.code)) {
+            return;
+        }
+        if (pressed) {
+            m_pressed.insert(ev.code);
+        } else {
+            m_pressed.remove(ev.code);
+        }
+        Q_EMIT keyChanged(ev.code, pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released, eventTime(ev), this);
+    }
+
+private:
+    QSet<quint32> m_pressed;
+};
+
+// ---------------------------------------------------------------- plugin
 
 class OtdTabletPlugin : public Plugin
 {
@@ -273,16 +362,21 @@ public:
     ~OtdTabletPlugin() override
     {
         // At shutdown KWin may already have destroyed input and the workspace.
-        if (m_device && input() && workspace()) {
-            drop();
+        const bool alive = input() && workspace();
+        for (OtdDevice **slot : {&m_tablet, &m_keyboard}) {
+            OtdDevice *device = std::exchange(*slot, nullptr);
+            if (device && alive) {
+                device->leave();
+                input()->removeInputDevice(device);
+            }
+            delete device;
         }
-        delete m_device;
     }
 
 private:
     void scan()
     {
-        if (m_device) {
+        if (m_tablet && m_keyboard) {
             return;
         }
         const QStringList nodes = QDir(QStringLiteral("/dev/input")).entryList({QStringLiteral("event*")}, QDir::System);
@@ -293,31 +387,42 @@ private:
                 continue;
             }
             char buf[256] = {};
-            if (ioctl(fd, EVIOCGNAME(sizeof(buf) - 1), buf) >= 0 && s_tabletNames.contains(QString::fromUtf8(buf))) {
-                m_device = new OtdTabletDevice(fd, path, QString::fromUtf8(buf));
-                connect(m_device, &OtdTabletDevice::gone, this, &OtdTabletPlugin::drop, Qt::QueuedConnection);
-                input()->addInputDevice(m_device);
-                qWarning("otdtablet: using %s (%s)", qPrintable(path), buf);
-                return;
+            const QString name = ioctl(fd, EVIOCGNAME(sizeof(buf) - 1), buf) >= 0 ? QString::fromUtf8(buf) : QString();
+            if (!m_tablet && s_tabletNames.contains(name)) {
+                add(&m_tablet, new OtdTabletDevice(fd, path, name));
+            } else if (!m_keyboard && name == s_keyboardName) {
+                add(&m_keyboard, new OtdKeyboardDevice(fd, path, name));
+            } else {
+                ::close(fd);
             }
-            ::close(fd);
         }
     }
 
-    void drop()
+    void add(OtdDevice **slot, OtdDevice *device)
     {
-        if (!m_device) {
+        *slot = device;
+        connect(device, &OtdDevice::gone, this, [this, slot]() {
+            drop(slot);
+        }, Qt::QueuedConnection);
+        input()->addInputDevice(device);
+        qWarning("otdtablet: using %s (%s)", qPrintable(device->sysPath()), qPrintable(device->name()));
+    }
+
+    void drop(OtdDevice **slot)
+    {
+        OtdDevice *device = std::exchange(*slot, nullptr);
+        if (!device) {
             return;
         }
-        qWarning("otdtablet: %s went away", qPrintable(m_device->sysPath()));
-        m_device->leave();
-        input()->removeInputDevice(m_device);
-        m_device->deleteLater();
-        m_device = nullptr;
+        qWarning("otdtablet: %s went away", qPrintable(device->sysPath()));
+        device->leave();
+        input()->removeInputDevice(device);
+        device->deleteLater();
     }
 
     QTimer m_scanTimer;
-    OtdTabletDevice *m_device = nullptr;
+    OtdDevice *m_tablet = nullptr;
+    OtdDevice *m_keyboard = nullptr;
 };
 
 class OtdTabletPluginFactory : public PluginFactory

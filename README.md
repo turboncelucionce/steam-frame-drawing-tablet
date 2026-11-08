@@ -2,7 +2,7 @@
 
 Makes your pen tablet compatible with the Steam Frame, since it doesn't ship with the drivers by default
 
-Currently doesn't support tablet buttons and touch, but pens buttons and sensitivity work (Tested with Wacom CTH-670 in Krita)
+Currently doesn't support touch, but pen buttons, tablet buttons and sensitivity work (Tested with Wacom CTH-670 in Krita)
 
 ## How to install
 
@@ -19,6 +19,8 @@ Make sure you have a sudo password (if you don't, run `passwd` in Konsole).
 4. Restart native desktop
 5. Open **OpenTabletDriver** from the app menu if it doesn't on its own, and set it to **Artist Mode** at the bottom
 6. It should work
+
+To use your tablet's buttons as shortcuts (like Ctrl+Z), set them in OpenTabletDriver's **Auxiliary Settings** tab.
 
 ### If an update breaks something
 
