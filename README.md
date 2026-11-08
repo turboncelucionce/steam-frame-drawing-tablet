@@ -12,8 +12,8 @@ Make sure you have a sudo password (if you don't, run `passwd` in Konsole).
 2. Run:
 
    ```bash
-   git clone https://github.com/turboncelucionce/steam-frame-drawing-tablet.git ~/steamframe-pentablet
-   bash ~/steamframe-pentablet/install.sh
+   git clone https://github.com/turboncelucionce/steam-frame-drawing-tablet.git ~/steam-frame-drawing-tablet
+   bash ~/steam-frame-drawing-tablet/install.sh
    ```
 3. Type your password when prompted
 4. Restart native desktop
@@ -27,7 +27,7 @@ To use your tablet's buttons as shortcuts (like Ctrl+Z), set them in OpenTabletD
 Try running:
 
 ```bash
-bash ~/steamframe-pentablet/kwin-otd-tablet/install.sh
+bash ~/steam-frame-drawing-tablet/kwin-otd-tablet/install.sh
 ```
 ## License
 
